@@ -1,1 +1,3 @@
 Microsoft Windows Server Project - Using powershell to install and config on Windows Server 2019
+
+Change "TEMPLATE-XLSX-FILE.xlsx" with Excel. Domain name should match with domain controller.
