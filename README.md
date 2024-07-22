@@ -8,3 +8,4 @@
 - [ ] Storage Spaces
 - [ ] IIS
 - [ ] GPO
+- [ ] Load Balancing 
