@@ -1,0 +1,182 @@
+#!/bin/bash
+
+# Display a menu for Ubuntu versions
+echo "Select Ubuntu Version:"
+echo "1. Ubuntu 24.04"
+echo "2. Ubuntu 22.04"
+echo "3. Ubuntu 20.04"
+read -p "Enter your choice (1, 2, or 3): " UBUNTU_CHOICE
+
+# Set the template ID based on the user's choice
+case $UBUNTU_CHOICE in
+  1)
+    TEMPLATE_ID=502404
+    ;;
+  2)
+    TEMPLATE_ID=502204
+    ;;
+  3)
+    TEMPLATE_ID=502004
+    ;;
+  *)
+    echo "Invalid choice, exiting."
+    exit 1
+    ;;
+esac
+
+# Prompt for additional inputs
+read -p "Enter New VM ID (or press Enter for auto-assignment): " VMID
+read -p "Enter New VM Name (or press Enter for VMID as name): " VM_NAME
+read -p "Enter RAM size (in GB, e.g., 4): " RAM
+read -p "Enter Number of CPU cores (total, e.g., 6): " CPU
+read -p "Enter Disk Size: " DISK_SIZE
+read -p "Enter VLAN Tag (or press Enter for none): " VLAN
+read -p "Enter IP Address (e.g., 192.168.1.100/24 or none for DHCP): " IP
+# Function to validate IP address with netmask
+validate_ip() {
+  if [[ "$1" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+/[0-9]+$ ]]; then
+    # Extract the netmask part and ensure it's between 0 and 32
+    NETMASK=$(echo "$1" | awk -F'/' '{print $2}')
+    if [[ "$NETMASK" -ge 0 && "$NETMASK" -le 32 ]]; then
+      return 0  # Valid IP with netmask
+    else
+      return 1  # Invalid netmask
+    fi
+  else
+    return 1  # Invalid IP format
+  fi
+}
+
+# Loop until a valid IP or 'none' is entered
+while [[ -n "$IP" && "$IP" != "none" ]]; do
+  if validate_ip "$IP"; then
+    break  # Exit the loop if valid
+  else
+    echo "Invalid IP address or netmask. Please ensure the format is correct (e.g., 192.168.1.100/24)."
+    read -p "Enter IP Address (e.g., 192.168.1.100/24 or none for DHCP): " IP
+  fi
+done
+# If a static IP is provided, prompt for the gateway
+if [[ -n "$IP" && "$IP" != "none" ]]; then
+  read -p "Enter Gateway (e.g., 192.168.1.1): " GATEWAY
+fi
+
+
+
+
+# Generate a VMID if not provided
+if [[ -z "$VMID" ]]; then
+  VMID=$(pvesh get /cluster/nextid)
+  echo "Auto-assigned VMID: $VMID"
+fi
+
+# Default VM name to VMID if none provided
+if [[ -z "$VM_NAME" ]]; then
+  VM_NAME=$VMID
+fi
+
+# Calculate the number of cores per socket (divide total CPU cores by 2)
+CORES_PER_SOCKET=$((CPU / 2))
+RAM_IN_GB=$((RAM*1024))
+
+# Clone the template
+echo "Cloning template..."
+qm clone $TEMPLATE_ID $VMID --name $VM_NAME
+
+# Wait until the VM is ready (status 'running' or 'stopped' after cloning)
+while true; do
+  VM_STATUS=$(qm status $VMID | awk '{print $2}')
+  if [[ "$VM_STATUS" == "running" || "$VM_STATUS" == "stopped" ]]; then
+    break
+  fi
+  echo "Waiting for VM to finish cloning..."
+  sleep 5  # Check every 5 seconds
+done
+
+# Configure VM specifications
+echo "Configuring VM..."
+qm set $VMID --memory $RAM_IN_GB --cores $CORES_PER_SOCKET --sockets 2
+
+# Calculate disk size with the additional 10GB
+if [[ -n "$DISK_SIZE" ]]; then
+  # Extract numeric part of the input (disk size)
+  DISK_SIZE_IN_GB=$(echo $DISK_SIZE | sed 's/[A-Za-z]*//g')  # Remove non-numeric characters
+
+  # Subtract 10GB from the user input
+  ADJUSTED_DISK_SIZE=$((DISK_SIZE_IN_GB - 10))
+
+  # If the adjusted size is greater than 0, set the new disk size
+  if [[ $ADJUSTED_DISK_SIZE -gt 0 ]]; then
+    DISK_SIZE="${ADJUSTED_DISK_SIZE}G"
+    echo "Adding additional disk of size $DISK_SIZE..."
+    qm set $VMID --scsi1 RAID5:$ADJUSTED_DISK_SIZE
+  else
+    echo "Invalid disk size input."
+  fi
+fi
+
+# Configure network based on VLAN input
+if [[ -n "$VLAN" ]]; then
+  echo "Setting VLAN to $VLAN and network bridge to vmbr1..."
+  qm set $VMID --net0 virtio,bridge=vmbr1,tag=$VLAN
+elif [[ "$VLAN" == "none" ]]; then
+  echo "No VLAN provided, setting network bridge to vmbr0..."
+  qm set $VMID --net0 virtio,bridge=vmbr0
+fi
+
+# Configure static IP or DHCP based on IP input
+if [[ -n "$IP" ]]; then
+  echo "Setting static IP to $IP..."
+  qm set $VMID --ipconfig0 ip=$IP,gw=$GATEWAY
+elif [[ "$IP" == "none" ]]; then
+  echo "No static IP provided, setting network to DHCP..."
+  # Use vmbr1 for VLAN or vmbr0 for no VLAN
+  qm set $VMID --ipconfig0 ip=dhcp
+fi
+
+
+# Wait for VM to boot and retrieve the randomized root password
+#echo "Waiting for cloud-init to complete..."
+#sleep 30 # Wait for the VM to initialize (adjust as needed)
+PASSWORD=$(pwgen -s -1 25)
+HASHED_PASSWORD=$(openssl passwd -6 "$PASSWORD")
+# Set Cloud-init password
+qm set $VMID --ciuser root --cipassword "$HASHED_PASSWORD"
+
+# Attached Cloud-init Drive
+qm set $VMID --ide2 RAID5:cloudinit
+#Set boot
+qm set $VMID --boot order=scsi0
+# Attached Cloud-init Custom
+qm set $VMID --cicustom "vendor=local:snippets/vender.yaml"
+
+#Waiting...
+echo "Waiting..."
+sleep 5
+
+# Start the VM
+echo "Starting the VM..."
+qm start $VMID
+echo ""
+echo ""
+echo ""
+
+# Return VM details and password
+echo "------------------------------------------"
+echo "VM Information:"
+echo "VMID: $VMID"
+echo "Name: $VM_NAME"
+echo "RAM: $RAM GB"
+echo "CPU: $CPU (Total), $CORES_PER_SOCKET per socket"
+[[ -n "$DISK_SIZE_IN_GB" ]] && echo "Disk: $DISK_SIZE_IN_GB GB"
+[[ -n "$VLAN" ]] && echo "VLAN: $VLAN"
+if [[ -n "$IP" && "$IP" != "none" ]]; then
+  echo "IP: $IP"
+  echo "Gateway: $GATEWAY"
+else
+  echo "IP: DHCP"
+fi
+echo "Username: root"
+echo "Password: $PASSWORD"
+echo "------------------------------------------"
+echo ""
